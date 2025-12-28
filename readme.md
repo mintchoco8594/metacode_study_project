@@ -117,3 +117,21 @@ RAG 질문: 근거 포함 여부, 답변 일관성, 회수율(top-k hit)
 “전기 기술이 땅 타입에 왜 안 통함?”
 
 “이 기술(Thunderbolt) 효과 설명하고, 어떤 포켓몬이 잘 쓰는지 알려줘”
+
+
+
+사용 데이터셋
+
+https://www.kaggle.com/datasets/rzgiza/pokdex-for-all-1025-pokemon-w-text-description/data
+
+https://www.kaggle.com/datasets/cristobalmitchell/pokedex?utm_source=chatgpt.com
+
+https://www.kaggle.com/datasets/arnavvvvv/pokemon-pokedex?utm_source=chatgpt.com
+
+https://github.com/PokeAPI/api-data?utm_source=chatgpt.com
+
+초기에는 번호 151번까지 데이터를 정제하고 이후 E2E 개발 후 확장
+
+
+데이터가 영문 베이스이므로 영문 챗봇으로 개발 후 확장
+
