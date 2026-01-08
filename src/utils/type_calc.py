@@ -105,3 +105,58 @@ def guess_move_type_from_text(text: str, valid_types: set[str]) -> str | None:
             return ty
 
     return None
+
+
+def calc_best_stab_attack(attacker_doc: dict, defender_doc: dict, chart: dict) -> dict:
+    atk_types = attacker_doc.get("meta", {}).get("types", []) or []
+    def_types = defender_doc.get("meta", {}).get("types", []) or []
+
+    # 타입 데이터 없으면 fallback
+    if not atk_types:
+        move_type = "normal"
+        type_mult = calc_type_multiplier(move_type, def_types, chart)
+        stab = 1.0
+        final_mult = type_mult * stab
+        return {
+            "move_type": move_type,
+            "type_mult": type_mult,
+            "stab": stab,
+            "mult": final_mult,
+            "label": label_by_multiplier(type_mult),
+        }
+
+    # 공격자 타입 중 상대에게 가장 유리한 타입 선택
+    best_type = None
+    best_type_mult = -1.0
+    for ty in atk_types:
+        m = calc_type_multiplier(ty, def_types, chart)
+        if m > best_type_mult:
+            best_type_mult = m
+            best_type = ty
+
+    stab = 1.5
+    final_mult = best_type_mult * stab
+    return {
+        "move_type": best_type,
+        "type_mult": best_type_mult,
+        "stab": stab,
+        "mult": final_mult,
+        "label": label_by_multiplier(best_type_mult),
+    }
+
+def calc_given_type_attack(attacker_doc: dict, defender_doc: dict, move_type: str, chart: dict) -> dict:
+    def_types = defender_doc.get("meta", {}).get("types", []) or []
+    atk_types = attacker_doc.get("meta", {}).get("types", []) or []
+
+    move_type = (move_type or "normal").strip().lower()
+    type_mult = calc_type_multiplier(move_type, def_types, chart)
+    stab = 1.5 if move_type in [t.lower() for t in atk_types] else 1.0
+    final_mult = type_mult * stab
+
+    return {
+        "move_type": move_type,
+        "type_mult": type_mult,
+        "stab": stab,
+        "mult": final_mult,
+        "label": label_by_multiplier(type_mult),
+    }

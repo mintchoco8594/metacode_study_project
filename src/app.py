@@ -1,4 +1,5 @@
 # app.py
+from itertools import combinations
 import json
 import re
 from pathlib import Path
@@ -7,7 +8,7 @@ import numpy as np
 import streamlit as st
 import faiss
 from sentence_transformers import SentenceTransformer
-
+from keybert import KeyBERT
 import utils.type_calc as type_calc
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -19,7 +20,7 @@ STORE_DIR = Path("src/rag_store")
 INDEX_PATH = STORE_DIR / "pokemon.index"
 DOCS_PATH = STORE_DIR / "documents.jsonl"
 TYPE_CHART_PATH = Path("src/data/type_chart.json")
-
+MAX_POKEMON = 4
 # ---------------- LangChain LLM (해설용) ----------------
 @st.cache_resource
 def get_llm():
@@ -32,6 +33,10 @@ def get_llm():
 @st.cache_resource
 def get_embedder():
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+@st.cache_resource
+def get_keybert():
+    return KeyBERT(model=get_embedder())
 
 @st.cache_resource
 def load_faiss_index():
@@ -76,6 +81,70 @@ def load_chart():
         raise FileNotFoundError(f"type_chart.json not found: {TYPE_CHART_PATH}")
     return type_calc.load_type_chart(TYPE_CHART_PATH)
 
+KO_STOPWORDS = {
+    "상대로","에게","한테","사용","기술","공격","쓰면","써","어때","어떻게","좀","해줘",
+    "분석","결과","추천","좋아","나빠","가능","가능해","말해","설명",
+    "vs","대",
+}
+
+def refine_input_with_keybert(text: str, valid_types: set[str], top_n: int = 6) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+
+    # 1) 포켓몬 이름은 기존 로직으로 먼저 확보(보존용)
+    preserved_names = extract_pokemon_names_from_text(raw, max_n=MAX_POKEMON)
+
+    # 2) KeyBERT로 키워드 추출
+    kb = get_keybert()
+    keywords = kb.extract_keywords(
+        raw,
+        keyphrase_ngram_range=(1, 2),
+        top_n=top_n,
+        use_mmr=True,        # 다양성 조금 확보
+        diversity=0.5,
+    )
+
+    # keywords: [(phrase, score), ...]
+    phrases = [p for (p, s) in keywords if p and s is not None]
+
+    # 3) 정제: 타입 단어/조사/잡단어 제거 + 너무 짧은 토큰 제거
+    cleaned_tokens = []
+    for ph in phrases:
+        ph = clean_name_token(ph, valid_types)  # 너가 이미 만들어둔 “타입단어/조사 제거기”
+        if not ph:
+            continue
+
+        # 공백 split 후 추가 필터링
+        for tok in ph.split():
+            t = tok.strip()
+            if not t:
+                continue
+            if len(t) <= 1:
+                continue
+            if t.lower() in KO_STOPWORDS:
+                continue
+            cleaned_tokens.append(t)
+
+    # 4) 포켓몬 이름/타입 키워드는 우선순위로 앞에 넣기
+    # (타입은 guess_move_type이 원문/정제문 둘 다에서 잘 잡게끔)
+    final = []
+    used = set()
+
+    for n in preserved_names:
+        if n not in used:
+            final.append(n)
+            used.add(n)
+
+    for t in cleaned_tokens:
+        if t not in used:
+            final.append(t)
+            used.add(t)
+
+    # 너무 짧아지면 원문 유지(정제 실패 방어)
+    refined = " ".join(final).strip()
+    return refined if len(refined) >= 2 else raw
+
 def search_docs(query: str, k: int = 8):
     embedder = get_embedder()          # ✅ 임베더
     index = load_faiss_index()
@@ -112,7 +181,7 @@ def clean_name_token(name: str, valid_types: set[str]) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def extract_pokemon_names_from_text(text: str, max_n: int = 2) -> list[str]:
+def extract_pokemon_names_from_text(text: str, max_n: int = MAX_POKEMON) -> list[str]:
     raw = (text or "").strip()
     if not raw:
         return []
@@ -175,34 +244,27 @@ def find_pokemon_by_name(name: str):
 def parse_battle_text(text: str, valid_types: set[str]) -> dict:
     raw = (text or "").strip()
     if not raw:
-        return {"a": "", "b": "", "move_type": None}
+        return {"names": [], "move_type": None}
+
     move_type = type_calc.guess_move_type_from_text(raw, valid_types)
 
-    names = extract_pokemon_names_from_text(raw, max_n=2)
-    if len(names) >= 2:
-        return {"a": names[0], "b": names[1], "move_type": move_type} 
-    # 1) A vs B / A 대 B
-    m = re.search(r"(.+?)\s*(?:vs|VS|대)\s*(.+)", raw)
-    if m:
-        a = clean_name_token(m.group(1).strip(), valid_types)
-        b = clean_name_token(m.group(2).strip(), valid_types)
-        move_type = type_calc.guess_move_type_from_text(raw, valid_types)
-        return {"a": a, "b": b, "move_type": move_type}
+    names = extract_pokemon_names_from_text(raw, max_n=MAX_POKEMON)
+    if names:
+        return {
+            "names": names,
+            "move_type": move_type
+        }
 
-    # 2) "A가 B를/을/상대로/에게/한테"
-    m = re.search(r"(.+?)(?:이|가)\s*(.+?)(?:를|을|상대로|에게|한테)", raw)
-    if m:
-        a = clean_name_token(m.group(1).strip(), valid_types)
-        b = clean_name_token(m.group(2).strip(), valid_types)
-        move_type = type_calc.guess_move_type_from_text(raw, valid_types)
-        return {"a": a, "b": b, "move_type": move_type}
-
-    # 3) fallback: 첫 두 토큰
+    # fallback
     parts = raw.split()
-    a = clean_name_token(parts[0], valid_types) if len(parts) >= 1 else ""
-    b = clean_name_token(parts[1], valid_types) if len(parts) >= 2 else ""
-    move_type = type_calc.guess_move_type_from_text(raw, valid_types)
-    return {"a": a, "b": b, "move_type": move_type}
+    cleaned = [clean_name_token(p, valid_types) for p in parts]
+    cleaned = [c for c in cleaned if c]
+
+    return {
+        "names": cleaned[:MAX_POKEMON],
+        "move_type": move_type
+    }
+
 
 
 
@@ -218,37 +280,85 @@ def render_result(a_doc: dict, b_doc: dict, move_type: str | None, mult: float |
         st.write(f"상성 레이블: {label}")
     else:
         st.write("공격 타입을 찾을 수 없어요.")
-    
-def build_rag_context(a_doc: dict, b_doc: dict) -> str:
-    a_meta = a_doc.get("meta", {})
-    b_meta = b_doc.get("meta", {})
 
-    a_name = a_meta.get("korean_name") or a_meta.get("english_name") or ""
-    b_name = b_meta.get("korean_name") or b_meta.get("english_name") or ""
+def render_results(results: list[dict]):
+    st.divider()
+    st.subheader("포켓몬 상성 분석(자속 기준, 양방향)")
 
-    a_types = a_meta.get("types", [])
-    b_types = b_meta.get("types", [])
+    for r in results:
+        atk_name = r["attacker_doc"]["meta"].get("korean_name") or r["attacker_doc"]["meta"].get("english_name") or ""
+        def_name = r["defender_doc"]["meta"].get("korean_name") or r["defender_doc"]["meta"].get("english_name") or ""
 
-    a_stats = a_meta.get("stats", {})
-    b_stats = b_meta.get("stats", {})
+        st.markdown(f"### {atk_name} ➜ {def_name}")
+        st.write(f"자속 타입 선택: {r['move_type']}")
+        st.write(f"타입 배율: {r['type_mult']:.2f}x")
+        st.write(f"자속(STAB): {r['stab']:.1f}x")
+        st.write(f"최종 배율: {r['mult']:.2f}x")
+        st.write(f"레이블(타입상성): {r['label']}")
+        st.write("---")
 
-    # text는 너무 길면 토큰 터지니까 자르자
-    a_text = (a_doc.get("text", "") or "")[:800]
-    b_text = (b_doc.get("text", "") or "")[:800]
 
-    return f"""
-[포켓몬 A 근거]
-이름: {a_name}
-타입: {a_types}
-스탯: {a_stats}
-설명: {a_text}
+def ask_llm_only(user_prompt: str) -> str:
+    llm = get_llm()
+    memory_text = build_chat_memory(max_turns=6)
 
-[포켓몬 B 근거]
-이름: {b_name}
-타입: {b_types}
-스탯: {b_stats}
-설명: {b_text}
+    prompt_for_llm = f"""
+너는 포켓몬 배틀 해설자야.
+모르면 추측하지 말고 "데이터에 없음"이라고 말해.
+
+[대화 메모리(최근)]
+{memory_text}
+
+[유저 질문]
+{user_prompt}
+
+요청: 한국어로 5~8줄 정도로 답해줘.
 """.strip()
+
+    return llm.invoke([HumanMessage(content=prompt_for_llm)]).content
+
+def build_rag_context_multi(hits: list[tuple[float, dict]], max_each_text: int = 400) -> str:
+    lines = []
+    for score, doc in hits:
+        meta = doc.get("meta", {})
+        name = meta.get("korean_name") or meta.get("english_name") or ""
+        types = meta.get("types", [])
+        stats = meta.get("stats", {})
+        text = (doc.get("text", "") or "")[:max_each_text]
+
+        lines.append(f"""
+[포켓몬 근거]
+이름: {name}
+타입: {types}
+스탯: {stats}
+설명: {text}
+""".strip())
+    return "\n\n".join(lines).strip()
+
+
+def build_chat_memory(max_turns: int = 6) -> str:
+    """
+    최근 max_turns개의 대화(유저/assistant)를 텍스트로 만들어 LLM에 넣는 용도
+    """
+    chat = st.session_state.get("chat", [])
+    if not chat:
+        return ""
+
+    # 마지막 max_turns개만
+    recent = chat[-max_turns:]
+    lines = []
+    for m in recent:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"유저: {content}")
+        else:
+            lines.append(f"assistant: {content}")
+    return "\n".join(lines)
+
+
 
 
 # ---------------- UI ----------------
@@ -261,61 +371,133 @@ valid_types = set(chart.keys())
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
+if "memo_cache" not in st.session_state:
+    st.session_state.memo_cache = {}
+
 prompt = st.chat_input("예) 리자몽이 이상해꽃 상대로 불꽃 기술 쓰면 어때? / 피카츄 vs 꼬부기 전기")
 
 if prompt:
     st.session_state.chat.append({"role": "user", "content": prompt})
+    cache_key = re.sub(r"\s+", " ", prompt.strip())
 
-    parsed = parse_battle_text(prompt, valid_types)
-    a_name = parsed["a"]
-    b_name = parsed["b"]
-    move_type = parsed["move_type"] or "normal"
-
-    a_hit = find_pokemon_by_name(a_name)
-    b_hit = find_pokemon_by_name(b_name)
-
-    if not a_hit or not b_hit:
-        msg = f"포켓몬을 못 찾았어. A='{a_name}', B='{b_name}' 입력을 조금 더 정확히 해봐."
-        st.session_state.chat.append({"role": "assistant", "content": msg})
+    if cache_key in st.session_state.memo_cache:
+        cached = st.session_state.memo_cache[cache_key]
+        refined_prompt = cached["refined_prompt"]
+        parsed = cached["parsed"]
+        hits = cached["hits"]
+        if not parsed.get("move_type"):
+            raw_type = type_calc.guess_move_type_from_text(prompt, valid_types)
+            if raw_type:
+                parsed["move_type"] = raw_type
+                st.session_state.memo_cache[cache_key]["parsed"] = parsed
     else:
-        _, a_doc = a_hit
-        _, b_doc = b_hit
 
-        # (선택) LangChain으로 “해설” 생성
+        raw_type  = type_calc.guess_move_type_from_text(prompt, valid_types)
+
+        refined_prompt = refine_input_with_keybert(prompt, valid_types)
+        parsed = parse_battle_text(refined_prompt, valid_types)
+        if not parsed.get("move_type") and raw_type :
+            parsed["move_type"] = raw_type 
+        names = parsed["names"]
+        hits = []
+        for name in names:
+            hit = find_pokemon_by_name(name)
+            if hit:
+                hits.append(hit)
+
+        # ✅ 캐시 저장
+        MAX_CACHE = 50
+        if len(st.session_state.memo_cache) >= MAX_CACHE:
+            oldest_key = next(iter(st.session_state.memo_cache))
+            del st.session_state.memo_cache[oldest_key]
+
+        st.session_state.memo_cache[cache_key] = {
+            "refined_prompt": refined_prompt,
+            "parsed": parsed,
+            "hits": hits,
+        }
+    
+    if len(hits) == 1:
+        context_one = build_rag_context_multi(hits, max_each_text=500)
+
         llm = get_llm()
-
-        context = build_rag_context(a_doc, b_doc)
-        mult = type_calc.calc_type_multiplier(move_type, b_doc["meta"].get("types", []), chart)
-        label = type_calc.label_by_multiplier(mult)
+        memory_text = build_chat_memory(max_turns=6)
 
         prompt_for_llm = f"""
-        너는 포켓몬 배틀 해설자야. 아래 [근거]에 있는 정보만 근거로 삼아 설명해.
+        너는 포켓몬 배틀 해설자야. 아래 [근거]만 근거로 설명해.
         모르면 추측하지 말고 "데이터에 없음"이라고 말해.
+
+        [대화 메모리(최근)]
+        {memory_text}
 
         [유저 질문]
         {prompt}
 
-        [계산 결과(룰베이스)]
-        - 공격 타입: {move_type}
-        - 타입 배율: {mult}x
-        - 상성 레이블: {label}
-
         [근거]
-        {context}
+        {context_one}
 
-        요청: 한국어로 5~8줄 정도로, 왜 그런지 근거(타입/스탯)를 섞어서 설명해줘.
+        요청: 한국어로 5~8줄 정도로 답해줘.
         """.strip()
 
         explain = llm.invoke([HumanMessage(content=prompt_for_llm)]).content
+        st.session_state.chat.append({"role": "assistant", "content": explain})
+    elif len(hits) == 0:
+        explain = ask_llm_only(prompt)
+        st.session_state.chat.append({"role": "assistant", "content": explain})
+    else:
+        results = []
+        user_move_type = (parsed.get("move_type") or "").strip().lower() or None
+        for (a_score, a_doc), (b_score, b_doc) in combinations(hits, 2):
+            if user_move_type:
+                ab = type_calc.calc_given_type_attack(a_doc, b_doc, user_move_type, chart)
+                ba = type_calc.calc_given_type_attack(b_doc, a_doc, user_move_type, chart)
+            else:
+                ab = type_calc.calc_best_stab_attack(a_doc, b_doc, chart)
+                ba = type_calc.calc_best_stab_attack(b_doc, a_doc, chart)
+
+            results.append({"attacker_doc": a_doc, "defender_doc": b_doc, **ab})
+            results.append({"attacker_doc": b_doc, "defender_doc": a_doc, **ba})
 
 
-        st.session_state.chat.append({
-            "role": "assistant",
-            "content": explain
-        })
+        render_results(results)
+
+        summary_lines = []
+        for r in results:
+            atk_name = r["attacker_doc"]["meta"].get("korean_name") or r["attacker_doc"]["meta"].get("english_name") or ""
+            def_name = r["defender_doc"]["meta"].get("korean_name") or r["defender_doc"]["meta"].get("english_name") or ""
+            stab_txt = "자속" if r["stab"] > 1.0 else "비자속"
+            summary_lines.append(
+                f"- {atk_name}→{def_name}: {r['move_type']} ({stab_txt}), {r['type_mult']:.2f}x×{r['stab']:.1f}={r['mult']:.2f}x ({r['label']})"
+            )
+        pairs_summary = "\n".join(summary_lines)
+
+
+        llm = get_llm()
+        memory_text = build_chat_memory(max_turns=6)
+        context_multi = build_rag_context_multi(hits, max_each_text=350)
+        prompt_for_llm = f"""
+        너는 포켓몬 배틀 해설자야. 아래 [근거]만 근거로 설명해.
+        모르면 추측하지 말고 "데이터에 없음"이라고 말해.
+
+        [대화 메모리(최근)]
+        {memory_text}
+
+        [유저 질문]
+        {refined_prompt}
+
+        [계산 결과(여러 쌍)]
+        {pairs_summary}
+
+        [근거]
+        {context_multi}
+
+        요청: 한국어로 5~8줄 정도로, 결과를 요약해서 설명해줘.
+        """.strip()
+
+        explain = llm.invoke([HumanMessage(content=prompt_for_llm)]).content
+        st.session_state.chat.append({"role": "assistant", "content": explain})
 
         st.divider()
-        render_result(a_doc, b_doc, move_type, mult, label)
 
 for m in st.session_state.chat:
     with st.chat_message(m["role"]):
