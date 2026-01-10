@@ -6,7 +6,7 @@ import json
 from sentence_transformers import SentenceTransformer
 
 CSV_PATH = Path("src/data/pokemon.csv")
-OUT_DIR = Path("rag_store")
+OUT_DIR = Path("src/rag_store")
 OUT_DIR.mkdir(exist_ok=True)
 
 df = pd.read_csv(CSV_PATH, encoding="utf-8")

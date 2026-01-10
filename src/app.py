@@ -266,21 +266,6 @@ def parse_battle_text(text: str, valid_types: set[str]) -> dict:
     }
 
 
-
-
-def render_result(a_doc: dict, b_doc: dict, move_type: str | None, mult: float | None, label: str | None):
-    st.divider()
-    st.subheader("포켓몬 상성 분석")
-    st.write(f"A: {a_doc['meta'].get('korean_name') or a_doc['meta'].get('english_name') or ''}")
-    st.write(f"B: {b_doc['meta'].get('korean_name') or b_doc['meta'].get('english_name') or ''}")
-    st.write(f"공격 타입: {move_type or 'normal'}")
-
-    if move_type and mult is not None:
-        st.write(f"상성 배율: {mult:.2f}x")
-        st.write(f"상성 레이블: {label}")
-    else:
-        st.write("공격 타입을 찾을 수 없어요.")
-
 def render_results(results: list[dict]):
     st.divider()
     st.subheader("포켓몬 상성 분석(자속 기준, 양방향)")
