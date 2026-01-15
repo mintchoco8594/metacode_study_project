@@ -283,26 +283,13 @@ def render_results(results: list[dict]):
         st.write("---")
 
 
-def ask_llm_only(user_prompt: str) -> str:
+def ask_llm_only(user_prompt: str, lang: str) -> str:
     llm = get_llm()
-    memory_text = build_chat_memory(max_turns=6)
-
-    prompt_for_llm = f"""
-너는 포켓몬 배틀 해설자야.
-모르면 추측하지 말고 "데이터에 없음"이라고 말해.
-
-[대화 메모리(최근)]
-{memory_text}
-
-[유저 질문]
-{user_prompt}
-
-요청: 한국어로 5~8줄 정도로 답해줘.
-""".strip()
-
+    memory_text = build_chat_memory(max_turns=6, lang=lang)
+    prompt_for_llm = build_llm_prompt(user_prompt, memory_text, lang)
     return llm.invoke([HumanMessage(content=prompt_for_llm)]).content
 
-def build_rag_context_multi(hits: list[tuple[float, dict]], max_each_text: int = 400) -> str:
+def build_rag_context_multi(hits: list[tuple[float, dict]], max_each_text: int = 400, lang: str = "ko") -> str:
     lines = []
     for score, doc in hits:
         meta = doc.get("meta", {})
@@ -311,7 +298,16 @@ def build_rag_context_multi(hits: list[tuple[float, dict]], max_each_text: int =
         stats = meta.get("stats", {})
         text = (doc.get("text", "") or "")[:max_each_text]
 
-        lines.append(f"""
+        if lang == "en":
+            lines.append(f"""
+[EVIDENCE: Pokemon]
+Name: {name}
+Types: {types}
+Stats: {stats}
+Description: {text}
+""".strip())
+        else:
+            lines.append(f"""
 [포켓몬 근거]
 이름: {name}
 타입: {types}
@@ -321,15 +317,11 @@ def build_rag_context_multi(hits: list[tuple[float, dict]], max_each_text: int =
     return "\n\n".join(lines).strip()
 
 
-def build_chat_memory(max_turns: int = 6) -> str:
-    """
-    최근 max_turns개의 대화(유저/assistant)를 텍스트로 만들어 LLM에 넣는 용도
-    """
+def build_chat_memory(max_turns: int = 6, lang: str = "ko") -> str:
     chat = st.session_state.get("chat", [])
     if not chat:
         return ""
 
-    # 마지막 max_turns개만
     recent = chat[-max_turns:]
     lines = []
     for m in recent:
@@ -337,13 +329,58 @@ def build_chat_memory(max_turns: int = 6) -> str:
         content = (m.get("content") or "").strip()
         if not content:
             continue
-        if role == "user":
-            lines.append(f"유저: {content}")
+
+        if lang == "en":
+            prefix = "User" if role == "user" else "Assistant"
         else:
-            lines.append(f"assistant: {content}")
+            prefix = "유저" if role == "user" else "assistant"
+
+        lines.append(f"{prefix}: {content}")
     return "\n".join(lines)
 
 
+def detect_lang(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return "ko"
+    # 한글 포함이면 한국어로
+    if re.search(r"[가-힣]", s):
+        return "ko"
+    return "en"
+
+def build_llm_prompt(user_prompt: str, memory_text: str, lang: str, context: str = "", pairs_summary: str = "") -> str:
+    if lang == "en":
+        base = """
+You are a Pokémon battle commentator.
+Use ONLY the provided [EVIDENCE]. If you don't know, say "Not in the data" and do not guess.
+""".strip()
+        mem_label = "[CHAT MEMORY (recent)]"
+        user_label = "[USER QUESTION]"
+        calc_label = "[CALC RESULTS (pairs)]"
+        evidence_label = "[EVIDENCE]"
+        request = "Request: Answer in English in about 5-8 lines."
+    else:
+        base = """
+너는 포켓몬 배틀 해설자야.
+아래 [근거]만 근거로 설명해.
+모르면 추측하지 말고 "데이터에 없음"이라고 말해.
+""".strip()
+        mem_label = "[대화 메모리(최근)]"
+        user_label = "[유저 질문]"
+        calc_label = "[계산 결과(여러 쌍)]"
+        evidence_label = "[근거]"
+        request = "요청: 한국어로 5~8줄 정도로 답해줘."
+
+    parts = [base, "", mem_label, memory_text or "", "", user_label, user_prompt or ""]
+
+    if pairs_summary:
+        parts += ["", calc_label, pairs_summary]
+
+    if context:
+        parts += ["", evidence_label, context]
+
+    parts += ["", request]
+    return "\n".join(parts).strip()
 
 
 # ---------------- UI ----------------
@@ -362,6 +399,7 @@ if "memo_cache" not in st.session_state:
 prompt = st.chat_input("예) 리자몽이 이상해꽃 상대로 불꽃 기술 쓰면 어때? / 피카츄 vs 꼬부기 전기")
 
 if prompt:
+    lang = detect_lang(prompt)
     st.session_state.chat.append({"role": "user", "content": prompt})
     cache_key = re.sub(r"\s+", " ", prompt.strip())
 
@@ -403,31 +441,20 @@ if prompt:
         }
     
     if len(hits) == 1:
-        context_one = build_rag_context_multi(hits, max_each_text=500)
-
+        context_one = build_rag_context_multi(hits, max_each_text=500, lang=lang)
         llm = get_llm()
-        memory_text = build_chat_memory(max_turns=6)
+        memory_text = build_chat_memory(max_turns=6, lang=lang)
 
-        prompt_for_llm = f"""
-        너는 포켓몬 배틀 해설자야. 아래 [근거]만 근거로 설명해.
-        모르면 추측하지 말고 "데이터에 없음"이라고 말해.
-
-        [대화 메모리(최근)]
-        {memory_text}
-
-        [유저 질문]
-        {prompt}
-
-        [근거]
-        {context_one}
-
-        요청: 한국어로 5~8줄 정도로 답해줘.
-        """.strip()
-
+        prompt_for_llm = build_llm_prompt(
+            user_prompt=prompt,
+            memory_text=memory_text,
+            lang=lang,
+            context=context_one
+        )
         explain = llm.invoke([HumanMessage(content=prompt_for_llm)]).content
         st.session_state.chat.append({"role": "assistant", "content": explain})
     elif len(hits) == 0:
-        explain = ask_llm_only(prompt)
+        explain = ask_llm_only(prompt, lang)
         st.session_state.chat.append({"role": "assistant", "content": explain})
     else:
         results = []
@@ -458,27 +485,15 @@ if prompt:
 
 
         llm = get_llm()
-        memory_text = build_chat_memory(max_turns=6)
-        context_multi = build_rag_context_multi(hits, max_each_text=350)
-        prompt_for_llm = f"""
-        너는 포켓몬 배틀 해설자야. 아래 [근거]만 근거로 설명해.
-        모르면 추측하지 말고 "데이터에 없음"이라고 말해.
-
-        [대화 메모리(최근)]
-        {memory_text}
-
-        [유저 질문]
-        {refined_prompt}
-
-        [계산 결과(여러 쌍)]
-        {pairs_summary}
-
-        [근거]
-        {context_multi}
-
-        요청: 한국어로 5~8줄 정도로, 결과를 요약해서 설명해줘.
-        """.strip()
-
+        memory_text = build_chat_memory(max_turns=6, lang=lang)
+        context_multi = build_rag_context_multi(hits, max_each_text=350, lang=lang)
+        prompt_for_llm = build_llm_prompt(
+            user_prompt=refined_prompt,
+            memory_text=memory_text,
+            lang=lang,
+            context=context_multi,
+            pairs_summary=pairs_summary
+        )
         explain = llm.invoke([HumanMessage(content=prompt_for_llm)]).content
         st.session_state.chat.append({"role": "assistant", "content": explain})
 
