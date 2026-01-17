@@ -1,0 +1,266 @@
+# front.py
+import json
+import uuid
+import queue
+import threading
+import time
+
+import requests
+import streamlit as st
+import websocket  # websocket-client
+
+API = "http://localhost:8000"
+WS_BASE = "ws://localhost:8000"
+
+WS_APPS = {}  # {player_id: websocket.WebSocketApp}
+
+st.set_page_config(page_title="Pokemon Battle Rooms (WS)", layout="wide")
+
+
+# =========================
+# REST helpers
+# =========================
+def get_rooms():
+    return requests.get(f"{API}/rooms", timeout=10).json()["rooms"]
+
+def join_room(room_id, player_id, nickname):
+    return requests.post(
+        f"{API}/rooms/{room_id}/join",
+        params={"player_id": player_id, "nickname": nickname},
+        timeout=10,
+    ).json()
+
+def leave_room(room_id, player_id):
+    return requests.post(
+        f"{API}/rooms/{room_id}/leave",
+        params={"player_id": player_id},
+        timeout=10,
+    ).json()
+
+
+# =========================
+# WS helpers
+# =========================
+def ws_url(room_id: int, player_id: str) -> str:
+    return f"{WS_BASE}/ws/rooms/{room_id}/{player_id}"
+
+def ensure_ws_started(room_id: int, player_id: str):
+    if st.session_state.get("ws_thread_alive"):
+        return
+
+    if "ws_queue" not in st.session_state:
+        st.session_state.ws_queue = queue.Queue()
+
+    q = st.session_state.ws_queue
+
+    def on_message(ws, message: str):
+        q.put(message)
+
+    def on_error(ws, error):
+        q.put(json.dumps({"type": "ws_error", "message": str(error)}, ensure_ascii=False))
+
+    def on_open(ws):
+        q.put(json.dumps({"type": "ws_open"}, ensure_ascii=False))
+
+    def on_close(ws, close_status_code, close_msg):
+        q.put(json.dumps({"type": "ws_closed", "code": close_status_code, "msg": close_msg}, ensure_ascii=False))
+        WS_APPS.pop(player_id, None)
+
+    def run():
+        ws = websocket.WebSocketApp(
+            ws_url(room_id, player_id),
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        WS_APPS[player_id] = ws
+        ws.run_forever(ping_interval=20, ping_timeout=10)
+
+    threading.Thread(target=run, daemon=True).start()
+    st.session_state.ws_thread_alive = True
+
+def ws_send_chat(player_id: str, content: str) -> bool:
+    ws = WS_APPS.get(player_id)
+    if not ws:
+        return False
+    try:
+        ws.send(json.dumps({"type": "chat", "content": content}, ensure_ascii=False))
+        return True
+    except Exception:
+        return False
+
+def ws_close(player_id: str):
+    ws = WS_APPS.pop(player_id, None)
+    if ws:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    st.session_state.ws_thread_alive = False
+    st.session_state.ws_connected = False
+
+
+# =========================
+# WS message drain
+# =========================
+def drain_ws_messages():
+    if "ws_queue" not in st.session_state:
+        return False
+
+    changed = False
+    while True:
+        try:
+            raw = st.session_state.ws_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        t = data.get("type")
+        if t in ("room_snapshot", "room_update"):
+            st.session_state.room = data.get("room")
+            changed = True
+        elif t == "notice":
+            # ✅ 룰 안내(대기/턴아님 등). 연결 끊김 아님!
+            st.session_state.last_notice = data.get("message")
+            changed = True
+        elif t == "ws_error":
+            st.session_state.last_notice = f"WS 에러: {data.get('message')}"
+            changed = True
+        elif t == "ws_open":
+            st.session_state.ws_connected = True
+            st.session_state.last_notice = None
+            changed = True
+        elif t == "ws_closed":
+            st.session_state.ws_connected = False
+            st.session_state.ws_thread_alive = False
+            st.session_state.last_notice = "웹소켓 끊김"
+            changed = True
+
+    return changed
+
+
+# =========================
+# state init
+# =========================
+if "player_id" not in st.session_state:
+    st.session_state.player_id = str(uuid.uuid4())
+if "nickname" not in st.session_state:
+    st.session_state.nickname = "player"
+if "room_id" not in st.session_state:
+    st.session_state.room_id = None
+if "room" not in st.session_state:
+    st.session_state.room = None
+if "ws_thread_alive" not in st.session_state:
+    st.session_state.ws_thread_alive = False
+if "ws_connected" not in st.session_state:
+    st.session_state.ws_connected = False
+if "last_notice" not in st.session_state:
+    st.session_state.last_notice = None
+if "ws_queue" not in st.session_state:
+    st.session_state.ws_queue = queue.Queue()
+
+drain_ws_messages()
+
+st.title("포켓몬 배틀 시뮬레이션 (방/웹소켓 + 서버 AI)")
+
+
+# =========================
+# lobby
+# =========================
+if st.session_state.room_id is None:
+    st.subheader("방 목록")
+    st.session_state.nickname = st.text_input("닉네임", st.session_state.nickname)
+
+    rooms = get_rooms()
+    for r in rooms:
+        cols = st.columns([1, 1, 2])
+        cols[0].write(f"방 {r['room_id']}")
+        cols[1].write(f"{r['count']}/2")
+
+        if cols[2].button("입장", disabled=r["is_full"], key=f"join{r['room_id']}"):
+            res = join_room(r["room_id"], st.session_state.player_id, st.session_state.nickname)
+
+            if "room" not in res:
+                st.error(f"입장 실패: {res}")
+                st.stop()
+
+            ws_close(st.session_state.player_id)
+
+            st.session_state.room_id = r["room_id"]
+            st.session_state.room = res["room"]
+            st.session_state.last_notice = None
+            st.session_state.ws_thread_alive = False
+            st.session_state.ws_connected = False
+
+            st.rerun()
+
+
+# =========================
+# room
+# =========================
+else:
+    room_id = st.session_state.room_id
+    my_id = st.session_state.player_id
+
+    ensure_ws_started(room_id, my_id)
+
+    room = st.session_state.room
+
+    st.subheader(f"방 {room_id}")
+    st.caption("🟢 WS: connected" if st.session_state.ws_connected else "🟡 WS: connecting...")
+
+    if st.button("나가기"):
+        try:
+            leave_room(room_id, my_id)
+        except Exception:
+            pass
+        ws_close(my_id)
+        st.session_state.room_id = None
+        st.session_state.room = None
+        st.rerun()
+
+    if st.session_state.last_notice:
+        st.info(st.session_state.last_notice)
+
+    if not room:
+        st.info("방 정보 받는 중...")
+        time.sleep(0.2)
+        st.rerun()
+
+    players = room.get("players", []) or []
+    turn_id = room.get("turn_player_id")
+
+    if len(players) < 2:
+        st.warning("상대방 입장 대기 중 (2명 되면 시작)")
+    else:
+        if turn_id == my_id:
+            st.success("니 턴")
+        else:
+            st.info("상대 턴")
+
+    for m in room.get("chat", []) or []:
+        st.markdown(f"**[{m.get('sender','')}]** {m.get('content','')}")
+
+    disabled = (
+        (len(players) < 2)  # 2명 되기 전엔 무조건 막기
+        or (turn_id is not None and turn_id != my_id)  # 턴제
+        or (not st.session_state.ws_connected)  # WS 연결 안 됨
+    )
+
+    with st.form("chat_form", clear_on_submit=True):
+        text = st.text_input("메시지", key="msg", disabled=disabled)
+        submitted = st.form_submit_button("전송", disabled=disabled)
+
+    if submitted and text.strip():
+        ok = ws_send_chat(my_id, text.strip())
+        if not ok:
+            st.warning("전송 실패(웹소켓 연결 확인)")
+        st.rerun()
+
+    time.sleep(0.2)
+    st.rerun()
