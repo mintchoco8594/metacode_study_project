@@ -9,13 +9,25 @@ import requests
 import streamlit as st
 import websocket  # websocket-client
 
+import logging
+
 API = "http://localhost:8000"
 WS_BASE = "ws://localhost:8000"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
+logger = logging.getLogger(__name__)
+logging.getLogger("websocket").setLevel(logging.WARNING)
 
 st.set_page_config(page_title="Pokemon Battle Rooms (WS)", layout="wide")
 
 
+def get_ws_holder():
+    if "ws_holder" not in st.session_state:
+        st.session_state.ws_holder = {"ws": None}
+    return st.session_state.ws_holder
 # =========================
 # REST helpers
 # =========================
@@ -44,13 +56,14 @@ def ws_url(room_id: int, player_id: str) -> str:
     return f"{WS_BASE}/ws/rooms/{room_id}/{player_id}"
 
 def ensure_ws_started(room_id: int, player_id: str):
-    # ws_app이 없거나, ws_thread_alive인데도 ws_app이 None이면 재시작
-    if st.session_state.get("ws_thread_alive") and st.session_state.get("ws_app") is not None:
+    holder = get_ws_holder()
+
+    t = st.session_state.get("ws_thread")
+    if t is not None and t.is_alive() and holder["ws"] is not None:
         return
 
     if "ws_queue" not in st.session_state:
         st.session_state.ws_queue = queue.Queue()
-
     q = st.session_state.ws_queue
 
     def on_message(ws, message: str):
@@ -64,7 +77,7 @@ def ensure_ws_started(room_id: int, player_id: str):
 
     def on_close(ws, close_status_code, close_msg):
         q.put(json.dumps({"type": "ws_closed", "code": close_status_code, "msg": close_msg}, ensure_ascii=False))
-        st.session_state.ws_app = None
+        holder["ws"] = None
 
     def run():
         ws = websocket.WebSocketApp(
@@ -74,15 +87,29 @@ def ensure_ws_started(room_id: int, player_id: str):
             on_error=on_error,
             on_close=on_close,
         )
-        st.session_state.ws_app = ws
+        holder["ws"] = ws
         ws.run_forever(ping_interval=20, ping_timeout=10)
 
-    threading.Thread(target=run, daemon=True).start()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    st.session_state.ws_thread = th
     st.session_state.ws_thread_alive = True
 
+def ws_send_pick(name: str) -> bool: 
+    ws = get_ws_holder()["ws"] 
+    if not ws: 
+        logger.debug("ws") 
+        return False 
+    try: 
+        logger.debug("전송성공") 
+        ws.send(json.dumps({"type": "pick", "name": name}, ensure_ascii=False)) 
+        return True 
+    except Exception: 
+        logger.debug("예외발생") 
+        return False
 
 def ws_send_chat(content: str) -> bool:
-    ws = st.session_state.get("ws_app")
+    ws = get_ws_holder()["ws"]
     if not ws:
         return False
     try:
@@ -93,15 +120,17 @@ def ws_send_chat(content: str) -> bool:
 
 
 def ws_close():
-    ws = st.session_state.get("ws_app")
+    holder = get_ws_holder()
+    ws = holder["ws"]
     if ws:
         try:
             ws.close()
         except Exception:
             pass
-    st.session_state.ws_app = None
+    holder["ws"] = None
     st.session_state.ws_thread_alive = False
     st.session_state.ws_connected = False
+
 
 
 
@@ -129,8 +158,8 @@ def drain_ws_messages():
             st.session_state.room = data.get("room")
             changed = True
         elif t == "notice":
-            # ✅ 룰 안내(대기/턴아님 등). 연결 끊김 아님!
             st.session_state.last_notice = data.get("message")
+            st.session_state.notice_ts = time.time()   # 추가
             changed = True
         elif t == "ws_error":
             st.session_state.last_notice = f"WS 에러: {data.get('message')}"
@@ -138,31 +167,22 @@ def drain_ws_messages():
         elif t == "ws_open":
             st.session_state.ws_connected = True
             st.session_state.last_notice = None
+            st.session_state.notice_ts = None
             changed = True
         elif t == "ws_closed":
             st.session_state.ws_connected = False
             st.session_state.ws_thread_alive = False
             st.session_state.last_notice = "웹소켓 끊김"
+            st.session_state.notice_ts = time.time()
             changed = True
 
     return changed
 
-def ws_send_pick(content: str) -> bool:
-    ws = st.session_state.get("ws_app")
-    if not ws:
-        return False
-    try:
-        ws.send(json.dumps({"type": "pick", "name": content}, ensure_ascii=False))
-        return True
-    except Exception:
-        return False
 
 
 # =========================
 # state init
 # =========================
-if "ws_app" not in st.session_state:
-    st.session_state.ws_app = None
 if "player_id" not in st.session_state:
     st.session_state.player_id = str(uuid.uuid4())
 if "nickname" not in st.session_state:
@@ -179,6 +199,10 @@ if "last_notice" not in st.session_state:
     st.session_state.last_notice = None
 if "ws_queue" not in st.session_state:
     st.session_state.ws_queue = queue.Queue()
+if "notice_ts" not in st.session_state:
+    st.session_state.notice_ts = None
+if "last_notice_shown_ts" not in st.session_state:
+    st.session_state.last_notice_shown_ts = None
 
 drain_ws_messages()
 
@@ -224,14 +248,21 @@ else:
     my_id = st.session_state.player_id
 
     ensure_ws_started(room_id, my_id)
-
+    drain_ws_messages()
     room = st.session_state.room
 
+    msg = st.session_state.get("last_notice")
+    ts = st.session_state.get("notice_ts")
+
+    if msg and ts and st.session_state.get("last_notice_shown_ts") != ts:
+        st.toast(msg)
+        st.session_state.last_notice_shown_ts = ts
     st.subheader(f"방 {room_id}")
     st.caption("🟢 WS: connected" if st.session_state.ws_connected else "🟡 WS: connecting...")
     if not st.session_state.ws_connected:
         st.warning("웹소켓 연결중입니다. 잠시만 기다려주세요.")
-        st.stop()
+        time.sleep(0.2)
+        st.rerun()
     if st.button("나가기"):
         try:
             leave_room(room_id, my_id)
@@ -242,15 +273,18 @@ else:
         st.session_state.room = None
         st.rerun()
 
-    if st.session_state.last_notice:
-        st.info(st.session_state.last_notice)
-
     if not room:
         st.info("방 정보 받는 중...")
         time.sleep(0.2)
         st.rerun()
 
     players = room.get("players", []) or []
+
+    st.markdown("❤️ 목숨")
+    for p in players:
+        lives = int(p.get("lives", 0) or 0)
+        hearts = "❤️" * lives + "🖤" * (3 - lives)
+        st.write(f"- {p.get('nickname')} : {hearts} ({lives}/3)")
     turn_id = room.get("turn_player_id")
 
     phase = room.get("phase", "pick")
@@ -270,7 +304,7 @@ else:
 
     if phase == "pick":
         st.info("포켓몬 선택 단계입니다. 사용할 포켓몬 이름을 입력해주세요.")
-    elif phase == "battle":
+    elif phase == "battle_running":
         st.info("배틀 진행 중... AI가 배틀 내용을 생성중입니다..")
     elif phase == "ended":
         winner = room.get("winner_player_id")
@@ -294,7 +328,7 @@ else:
         (len(players) < 2)
         or (turn_id is not None and turn_id != my_id)
         or (not st.session_state.ws_connected)
-        or (phase in ("battle", "ended"))
+        or (phase in ("battle_running", "ended"))
         or (phase == "pick" and my_picked)
     )
 
@@ -303,7 +337,7 @@ else:
             name = st.text_input("포켓몬 이름", key="pick_name", disabled=disabled)
             submitted = st.form_submit_button("선택", disabled=disabled)
         if submitted and name.strip():
-            ok = ws_send_pick(my_id, name.strip())
+            ok = ws_send_pick(name.strip())
             if not ok:
                 st.warning("선택 전송 실패(웹소켓 연결 확인)")
             st.rerun()

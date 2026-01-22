@@ -3,15 +3,12 @@ import asyncio
 import json
 import time
 import re
-from itertools import combinations
 from pathlib import Path
 from functools import lru_cache
 from typing import Dict, Optional, List, Tuple
 
-import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
-from keybert import KeyBERT
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,13 +28,8 @@ STORE_DIR = Path("src/rag_store")
 INDEX_PATH = STORE_DIR / "pokemon.index"
 DOCS_PATH = STORE_DIR / "documents.jsonl"
 TYPE_CHART_PATH = Path("src/data/type_chart.json")
-MAX_POKEMON = 4
+MAX_POKEMON = 1
 
-KO_STOPWORDS = {
-    "상대로", "에게", "한테", "사용", "기술", "공격", "쓰면", "써", "어때", "어떻게", "좀", "해줘",
-    "분석", "결과", "추천", "좋아", "나빠", "가능", "가능해", "말해", "설명",
-    "vs", "대",
-}
 
 
 @lru_cache(maxsize=1)
@@ -211,36 +203,82 @@ Description: {text}
     return "\n\n".join(lines).strip()
 
 
-def build_llm_prompt(user_prompt: str, memory_text: str, lang: str, context: str = "", pairs_summary: str = "") -> str:
+def build_llm_prompt(
+    user_prompt: str,
+    memory_text: str,
+    lang: str,
+    context: str = "",
+    pairs_summary: str = "",
+) -> str:
     if lang == "en":
         base = """
 You are a Pokémon battle commentator.
-Use ONLY the provided [EVIDENCE]. If you don't know, say "Not in the data" and do not guess.
+
+Rules (MANDATORY):
+- Use ONLY information explicitly written in [CALC RESULTS] and [EVIDENCE].
+- Do NOT invent moves, turns, status effects, abilities, items, accuracy, critical hits, or battle flow.
+- Do NOT describe actions like "used X move" or "attacked first".
+- If something is not written in the evidence, say exactly: "Not in the data".
+- The winner is already determined in the evidence. Do NOT change it.
 """.strip()
-        mem_label = "[CHAT MEMORY (recent)]"
-        user_label = "[USER QUESTION]"
-        calc_label = "[CALC RESULTS (pairs)]"
+
+        request = """
+Output format (STRICT):
+Winner or Draw (1 line)
+Comment: Comment each pokemon's type and use type multiplier and score from [CALC RESULTS] (4~6 lines)
+Total length: 5~8 lines.
+""".strip()
+
+        mem_label = "[CHAT MEMORY]"
+        user_label = "[USER REQUEST]"
+        calc_label = "[CALC RESULTS]"
         evidence_label = "[EVIDENCE]"
-        request = "Request: Answer in English in about 5-8 lines."
+
     else:
         base = """
 너는 포켓몬 배틀 해설자야.
-아래 [근거]만 근거로 설명해.
-모르면 추측하지 말고 "데이터에 없음"이라고 말해.
-""".strip()
-        mem_label = "[대화 메모리(최근)]"
-        user_label = "[유저 질문]"
-        calc_label = "[계산 결과(여러 쌍)]"
-        evidence_label = "[근거]"
-        request = "요청: 한국어로 5~8줄 정도로 답해줘."
 
-    parts = [base, "", mem_label, memory_text or "", "", user_label, user_prompt or ""]
+규칙(반드시 지켜):
+- 오직 [계산 결과]와 [근거]에 **명시된 정보만** 사용해.
+- 기술 사용, 턴 순서, 상태이상, 특성, 아이템, 급소, 명중/회피 같은
+  배틀 연출을 절대 만들어내지 마.
+- 승자, 타입 배율, score는 반드시 [계산 결과]에 있는 문장만 인용해.
+- 근거에 없는 내용은 반드시 정확히 "데이터에 없음"이라고 말해.
+- 승자는 이미 확정되어 있으니 바꾸거나 추측하지 마.
+""".strip()
+
+        request = """
+출력 형식(엄격):
+승자 또는 무승부 (1줄)
+해설: 각 포켓몬의 타입, 타입 배율 + score 근거 설명 (4~6줄)
+총 5~8줄.
+""".strip()
+
+    mem_label = "[대화 메모리]"
+    user_label = "[유저 요청]"
+    calc_label = "[계산 결과]"
+    evidence_label = "[근거]"
+
+    parts = [
+        base,
+        "",
+        mem_label,
+        memory_text or "",
+        "",
+        user_label,
+        user_prompt or "",
+    ]
+
     if pairs_summary:
         parts += ["", calc_label, pairs_summary]
+
     if context:
         parts += ["", evidence_label, context]
+
     parts += ["", request]
+
     return "\n".join(parts).strip()
+
 
 
 # =========================
@@ -254,7 +292,7 @@ class Player:
         self.picked: bool = False
         self.pokemon_name: Optional[str] = None
         self.pokemon_doc: Optional[dict] = None
-
+        self.lives: int = 3
 
 class RoomState:
     def __init__(self, room_id: int):
@@ -303,7 +341,8 @@ def snapshot_room(room: RoomState) -> dict:
                 "player_id": p.player_id,
                 "nickname": p.nickname,
                 "picked": p.picked,
-                "pokemon_name": p.pokemon_name,
+                "pokemon_name": (p.pokemon_name if room.phase != "pick" else None),
+                "lives": p.lives,
             }
             for p in room.players
         ],
@@ -551,13 +590,25 @@ async def ws_room(websocket: WebSocket, room_id: int, player_id: str):
                     player.pokemon_name = name
                     player.pokemon_doc = doc
 
-                    room.chat.append({"role": "system", "sender": "system", "content": f"{player.nickname} 포켓몬 선택: {name}", "ts": time.time()})
+                    room.chat.append({
+                        "role": "system",
+                        "sender": "system",
+                        "content": f"{player.nickname} 선택 완료!",
+                        "ts": time.time()
+                    })
 
                     # 턴 넘기기
                     room.turn_index = (room.turn_index + 1) % len(room.players)
 
                     # 둘 다 골랐으면 battle 진입
                     if all(p.picked for p in room.players):
+                        p1, p2 = room.players[0], room.players[1]
+                        room.chat.append({
+                            "role": "system",
+                            "sender": "system",
+                            "content": f"선택 완료! {p1.nickname}: {p1.pokemon_name} / {p2.nickname}: {p2.pokemon_name}",
+                            "ts": time.time()
+                        })
                         room.phase = "battle"
 
                     payload = {"type": "room_update", "room": snapshot_room(room)}
@@ -573,29 +624,43 @@ async def ws_room(websocket: WebSocket, room_id: int, player_id: str):
 
                     if sim["winner"] == "p1":
                         winner_player_id = p1.player_id
+                        loser_player_id = p2.player_id
                         win_name = p1.nickname
+                        lose_name = p2.nickname
                     elif sim["winner"] == "p2":
                         winner_player_id = p2.player_id
+                        loser_player_id = p1.player_id
                         win_name = p2.nickname
+                        lose_name = p1.nickname
                     else:
                         winner_player_id = None
+                        loser_player_id = None
                         win_name = "무승부"
+                        lose_name = "무승부"
+
 
                     hits = [(1.0, p1.pokemon_doc), (1.0, p2.pokemon_doc)]
                     context = build_rag_context_multi(hits, max_each_text=350, lang="ko")
-                    pairs_summary = "\n".join([
-                        f"- {p1.pokemon_name}→{p2.pokemon_name}: {sim['a_to_b']['move_type']} {sim['a_to_b']['mult']:.2f}x ({sim['a_to_b']['label']}) / score={sim['a_score']:.1f}",
-                        f"- {p2.pokemon_name}→{p1.pokemon_name}: {sim['b_to_a']['move_type']} {sim['b_to_a']['mult']:.2f}x ({sim['b_to_a']['label']}) / score={sim['b_score']:.1f}",
-                        f"- 최종 승자: {win_name}",
+
+
+                    result_evidence = "\n".join([
+                        "[확정 결과]",
+                        f"승자: {win_name}",
+                        f"패자: {lose_name}" if loser_player_id else "패자: 없음(무승부)",
+                        f"{p1.pokemon_name}→{p2.pokemon_name}: {sim['a_to_b']['move_type']} {sim['a_to_b']['mult']:.2f}x ({sim['a_to_b']['label']}) score={sim['a_score']:.1f}",
+                        f"{p2.pokemon_name}→{p1.pokemon_name}: {sim['b_to_a']['move_type']} {sim['b_to_a']['mult']:.2f}x ({sim['b_to_a']['label']}) score={sim['b_score']:.1f}",
                     ])
 
                     battle_job = {
                         "winner_player_id": winner_player_id,
+                        "loser_player_id": loser_player_id,
                         "win_name": win_name,
-                        "context": context,
-                        "pairs_summary": pairs_summary,
-                        "user_prompt": f"{p1.pokemon_name} vs {p2.pokemon_name} 배틀 결과 해설해줘. 승자는 {win_name}로 확정이야.",
+                        "lose_name": lose_name,
+                        "context": context.strip(),
+                        "pairs_summary": result_evidence,
+                        "user_prompt": "위 [계산 결과]와 [근거]만 사용해서 5~8줄로 해설해. 근거에 없는 배틀 전개/기술/턴/상태이상/아이템/특성은 절대 말하지 마.",
                     }
+
 
                     # battle_running 상태도 클라에 바로 알려주고 싶으면 여기서 payload 만들어도 됨
                     payload = {"type": "room_update", "room": snapshot_room(room)}
@@ -625,15 +690,67 @@ async def ws_room(websocket: WebSocket, room_id: int, player_id: str):
             # =========================
             # 3) 다시 락: 결과 반영 + ended
             # =========================
+            # 3) 다시 락: 결과 반영 + (다음 라운드 or ended)
             async with room.lock:
-                room.winner_player_id = battle_job["winner_player_id"]
+                # 이번 라운드 해설 추가
                 room.chat.append({"role": "assistant", "sender": "assistant", "content": assistant_text, "ts": time.time()})
-                room.chat.append({"role": "system", "sender": "system", "content": f"게임 종료! 승자: {battle_job['win_name']}", "ts": time.time()})
-                room.phase = "ended"
+
+                # 패배자 목숨 차감 (무승부면 없음)
+                loser_id = battle_job.get("loser_player_id")
+                if loser_id:
+                    loser = room.find_player(loser_id)
+                    if loser:
+                        loser.lives = max(0, loser.lives - 1)
+
+                # lives 체크
+                p1, p2 = room.players[0], room.players[1]
+                match_over = (p1.lives <= 0) or (p2.lives <= 0)
+
+                if match_over:
+                    # ✅ 매치 종료
+                    room.winner_player_id = battle_job["winner_player_id"]
+                    room.chat.append({
+                        "role": "system",
+                        "sender": "system",
+                        "content": f"게임 종료! 승자: {battle_job['win_name']}",
+                        "ts": time.time(),
+                    })
+                    room.phase = "ended"
+                else:
+                    # ✅ 다음 라운드 준비: 포켓몬 선택 초기화
+                    for p in room.players:
+                        p.picked = False
+                        p.pokemon_name = None
+                        p.pokemon_doc = None
+
+                    # 다음 라운드 선턴: 패배자부터 고르게(밸런스)
+                    if loser_id:
+                        loser_idx = 0 if room.players[0].player_id == loser_id else 1
+                        room.turn_index = loser_idx
+
+                    room.winner_player_id = None
+                    room.phase = "pick"
+
+                    # 라운드 종료 로그
+                    if loser_id:
+                        room.chat.append({
+                            "role": "system",
+                            "sender": "system",
+                            "content": f"라운드 종료! {battle_job['lose_name']} 목숨 -1. 다음 라운드 포켓몬 다시 선택!",
+                            "ts": time.time(),
+                        })
+                    else:
+                        room.chat.append({
+                            "role": "system",
+                            "sender": "system",
+                            "content": "라운드 종료! 무승부. 다음 라운드 포켓몬 다시 선택!",
+                            "ts": time.time(),
+                        })
 
                 final_payload = {"type": "room_update", "room": snapshot_room(room)}
 
             await broadcast_room(room, final_payload)
+
 
     except WebSocketDisconnect:
         async with room.lock:
