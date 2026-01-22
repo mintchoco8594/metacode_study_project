@@ -9,7 +9,7 @@ import streamlit as st
 import faiss
 from sentence_transformers import SentenceTransformer
 from keybert import KeyBERT
-import utils.type_calc as type_calc
+from src.utils import type_calc
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import os

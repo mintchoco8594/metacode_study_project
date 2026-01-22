@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
-import utils.type_calc as type_calc
+from src.utils import type_calc
 
 load_dotenv()
 
@@ -143,70 +143,6 @@ def extract_pokemon_names_from_text(text: str, max_n: int = MAX_POKEMON) -> List
     return found
 
 
-def clean_name_token(name: str, valid_types: set[str]) -> str:
-    s = (name or "").strip()
-
-    for ko in type_calc.TYPE_ALIAS_KO.keys():
-        s = s.replace(ko, " ")
-
-    for ty in valid_types:
-        s = re.sub(rf"\b{re.escape(ty)}\b", " ", s, flags=re.IGNORECASE)
-
-    s = re.sub(r"(상대로|에게|한테|사용|기술|공격|쓰면|써|로)\b", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def refine_input_with_keybert(text: str, valid_types: set[str], top_n: int = 6) -> str:
-    raw = (text or "").strip()
-    if not raw:
-        return raw
-
-    preserved_names = extract_pokemon_names_from_text(raw, max_n=MAX_POKEMON)
-
-    kb = get_keybert()
-    keywords = kb.extract_keywords(
-        raw,
-        keyphrase_ngram_range=(1, 2),
-        top_n=top_n,
-        use_mmr=True,
-        diversity=0.5,
-    )
-
-    phrases = [p for (p, s) in keywords if p and s is not None]
-
-    cleaned_tokens = []
-    for ph in phrases:
-        ph = clean_name_token(ph, valid_types)
-        if not ph:
-            continue
-        for tok in ph.split():
-            t = tok.strip()
-            if not t:
-                continue
-            if len(t) <= 1:
-                continue
-            if t.lower() in KO_STOPWORDS:
-                continue
-            cleaned_tokens.append(t)
-
-    final = []
-    used = set()
-
-    for n in preserved_names:
-        if n not in used:
-            final.append(n)
-            used.add(n)
-
-    for t in cleaned_tokens:
-        if t not in used:
-            final.append(t)
-            used.add(t)
-
-    refined = " ".join(final).strip()
-    return refined if len(refined) >= 2 else raw
-
-
 def search_docs(query: str, k: int = 8) -> List[Tuple[float, dict]]:
     embedder = get_embedder()
     index = load_faiss_index()
@@ -245,24 +181,6 @@ def find_pokemon_by_name(name: str):
     if score < 0.35:
         return None
     return score, doc
-
-
-def parse_battle_text(text: str, valid_types: set[str]) -> dict:
-    raw = (text or "").strip()
-    if not raw:
-        return {"names": [], "move_type": None}
-
-    move_type = type_calc.guess_move_type_from_text(raw, valid_types)
-
-    names = extract_pokemon_names_from_text(raw, max_n=MAX_POKEMON)
-    if names:
-        return {"names": names, "move_type": move_type}
-
-    parts = raw.split()
-    cleaned = [clean_name_token(p, valid_types) for p in parts]
-    cleaned = [c for c in cleaned if c]
-
-    return {"names": cleaned[:MAX_POKEMON], "move_type": move_type}
 
 
 def build_rag_context_multi(hits: List[Tuple[float, dict]], max_each_text: int = 400, lang: str = "ko") -> str:
@@ -325,98 +243,6 @@ Use ONLY the provided [EVIDENCE]. If you don't know, say "Not in the data" and d
     return "\n".join(parts).strip()
 
 
-def ask_llm_only(user_prompt: str, lang: str, memory_text: str = "") -> str:
-    llm = get_llm()
-    prompt_for_llm = build_llm_prompt(user_prompt, memory_text, lang)
-    return llm.invoke([HumanMessage(content=prompt_for_llm)]).content
-
-
-def build_room_memory(room_chat: List[dict], max_turns: int = 8) -> str:
-    chat = (room_chat or [])[-max_turns:]
-    lines = []
-    for m in chat:
-        sender = (m.get("sender") or "").strip() or "unknown"
-        content = (m.get("content") or "").strip()
-        if not content:
-            continue
-        lines.append(f"user({sender}): {content}" if m.get("role") != "assistant" else f"assistant: {content}")
-    return "\n".join(lines)
-
-
-def bot_generate_reply(user_text: str, room_chat: List[dict]) -> str:
-    lang = detect_lang(user_text)
-
-    chart = load_chart()
-    valid_types = set(chart.keys())
-
-    memory_text = build_room_memory(room_chat, max_turns=8)
-
-    raw_type = type_calc.guess_move_type_from_text(user_text, valid_types)
-    refined_prompt = refine_input_with_keybert(user_text, valid_types)
-    parsed = parse_battle_text(refined_prompt, valid_types)
-    if not parsed.get("move_type") and raw_type:
-        parsed["move_type"] = raw_type
-
-    names = parsed["names"]
-    hits = []
-    for name in names:
-        hit = find_pokemon_by_name(name)
-        if hit:
-            hits.append(hit)
-
-    if len(hits) == 1:
-        context_one = build_rag_context_multi(hits, max_each_text=500, lang=lang)
-        llm = get_llm()
-        prompt_for_llm = build_llm_prompt(
-            user_prompt=user_text,
-            memory_text=memory_text,
-            lang=lang,
-            context=context_one,
-        )
-        return llm.invoke([HumanMessage(content=prompt_for_llm)]).content
-
-    if len(hits) == 0:
-        return ask_llm_only(user_text, lang, memory_text=memory_text)
-
-    results = []
-    user_move_type = (parsed.get("move_type") or "").strip().lower() or None
-    for (a_score, a_doc), (b_score, b_doc) in combinations(hits, 2):
-        if user_move_type:
-            ab = type_calc.calc_given_type_attack(a_doc, b_doc, user_move_type, chart)
-            ba = type_calc.calc_given_type_attack(b_doc, a_doc, user_move_type, chart)
-        else:
-            ab = type_calc.calc_best_stab_attack(a_doc, b_doc, chart)
-            ba = type_calc.calc_best_stab_attack(b_doc, a_doc, chart)
-
-        results.append({"attacker_doc": a_doc, "defender_doc": b_doc, **ab})
-        results.append({"attacker_doc": b_doc, "defender_doc": a_doc, **ba})
-
-    summary_lines = []
-    for r in results:
-        atk_name = r["attacker_doc"]["meta"].get("korean_name") or r["attacker_doc"]["meta"].get("english_name") or ""
-        def_name = r["defender_doc"]["meta"].get("korean_name") or r["defender_doc"]["meta"].get("english_name") or ""
-        stab_txt = "자속" if r["stab"] > 1.0 else "비자속"
-        summary_lines.append(
-            f"- {atk_name}→{def_name}: {r['move_type']} ({stab_txt}), {r['type_mult']:.2f}x×{r['stab']:.1f}={r['mult']:.2f}x ({r['label']})"
-        )
-    pairs_summary = "\n".join(summary_lines)
-
-    llm = get_llm()
-    context_multi = build_rag_context_multi(hits, max_each_text=350, lang=lang)
-    prompt_for_llm = build_llm_prompt(
-        user_prompt=refined_prompt,
-        memory_text=memory_text,
-        lang=lang,
-        context=context_multi,
-        pairs_summary=pairs_summary,
-    )
-    return llm.invoke([HumanMessage(content=prompt_for_llm)]).content
-
-
-def answer_with_rag(user_text: str, room_chat: List[dict]) -> str:
-    return bot_generate_reply(user_text, room_chat)
-
-
 # =========================
 # 룸/WS 서버
 # =========================
@@ -425,6 +251,9 @@ class Player:
         self.player_id = player_id
         self.nickname = nickname
         self.ws: Optional[WebSocket] = None
+        self.picked: bool = False
+        self.pokemon_name: Optional[str] = None
+        self.pokemon_doc: Optional[dict] = None
 
 
 class RoomState:
@@ -434,13 +263,15 @@ class RoomState:
         self.turn_index: int = 0
         self.chat: List[dict] = []
         self.lock = asyncio.Lock()
+        self.phase: str = "pick"          # pick | battle | battle_running | ended
+        self.winner_player_id: Optional[str] = None
 
     def is_full(self) -> bool:
         return len(self.players) >= 2
 
     def current_player_id(self) -> Optional[str]:
         if len(self.players) < 2:
-            return None  # 2명 미만이면 턴 없음
+            return None
         return self.players[self.turn_index % len(self.players)].player_id
 
     def find_player(self, player_id: str) -> Optional[Player]:
@@ -465,9 +296,50 @@ app.add_middleware(
 def snapshot_room(room: RoomState) -> dict:
     return {
         "room_id": room.room_id,
-        "players": [{"player_id": p.player_id, "nickname": p.nickname} for p in room.players],
+        "phase": room.phase,
+        "winner_player_id": room.winner_player_id,
+        "players": [
+            {
+                "player_id": p.player_id,
+                "nickname": p.nickname,
+                "picked": p.picked,
+                "pokemon_name": p.pokemon_name,
+            }
+            for p in room.players
+        ],
         "turn_player_id": room.current_player_id(),
         "chat": room.chat[-200:],
+    }
+
+
+def get_offense_stat(doc: dict) -> float:
+    stats = (doc.get("meta", {}) or {}).get("stats", {}) or {}
+    atk = float(stats.get("attack", 0) or 0)
+    spa = float(stats.get("sp_attack", 0) or 0)
+    return max(atk, spa, 1.0)
+
+
+def simulate_battle(p1_doc: dict, p2_doc: dict, chart: dict) -> dict:
+    a_to_b = type_calc.calc_best_stab_attack(p1_doc, p2_doc, chart)
+    b_to_a = type_calc.calc_best_stab_attack(p2_doc, p1_doc, chart)
+
+    a_stat = get_offense_stat(p1_doc)
+    b_stat = get_offense_stat(p2_doc)
+
+    a_score = float(a_to_b["mult"]) * a_stat
+    b_score = float(b_to_a["mult"]) * b_stat
+
+    if abs(a_score - b_score) < 1e-6:
+        winner = "draw"
+    else:
+        winner = "p1" if a_score > b_score else "p2"
+
+    return {
+        "a_to_b": a_to_b,
+        "b_to_a": b_to_a,
+        "a_score": a_score,
+        "b_score": b_score,
+        "winner": winner,
     }
 
 
@@ -556,6 +428,13 @@ async def join_room(room_id: int, player_id: str, nickname: str):
         if room.is_full():
             raise HTTPException(409, "room is full")
 
+        # 방이 비어있던 상태면 새 게임 초기화
+        if len(room.players) == 0:
+            room.phase = "pick"
+            room.winner_player_id = None
+            room.turn_index = 0
+            room.chat = []
+
         room.players.append(Player(player_id, nickname))
         room.chat.append({"role": "system", "sender": "system", "content": f"{nickname} 입장", "ts": time.time()})
 
@@ -613,23 +492,35 @@ async def ws_room(websocket: WebSocket, room_id: int, player_id: str):
     try:
         while True:
             raw = await websocket.receive_text()
+
             try:
                 data = json.loads(raw)
             except Exception:
                 continue
 
-            if data.get("type") != "chat":
-                continue
+            msg_type = data.get("type")
+            payload = None
+            battle_job = None  # 락 밖에서 실행할 LLM 작업
 
-            user_text = (data.get("content") or "").strip()
-            if not user_text:
-                continue
-
+            # =========================
+            # 1) 락 안: 상태 변경 + battle_job 준비
+            # =========================
             async with room.lock:
                 if len(room.players) < 2:
                     await websocket.send_text(json.dumps({"type": "notice", "code": "WAITING", "message": "상대방 입장 대기 중"}, ensure_ascii=False))
                     continue
 
+                # battle_running 중엔 그냥 막기
+                if room.phase == "battle_running":
+                    await websocket.send_text(json.dumps({"type": "notice", "code": "BATTLE_RUNNING", "message": "배틀 계산 중... 잠깐만"}, ensure_ascii=False))
+                    continue
+
+                # 종료면 막기
+                if room.phase == "ended":
+                    await websocket.send_text(json.dumps({"type": "notice", "code": "ENDED", "message": "게임 끝남. 방을 나가거나 새로 시작해."}, ensure_ascii=False))
+                    continue
+
+                # 턴 체크(ended/battle_running 아닌 상태에서만)
                 if room.current_player_id() != player_id:
                     await websocket.send_text(json.dumps({"type": "notice", "code": "NOT_YOUR_TURN", "message": "상대의 턴입니다."}, ensure_ascii=False))
                     continue
@@ -639,21 +530,110 @@ async def ws_room(websocket: WebSocket, room_id: int, player_id: str):
                     await websocket.send_text(json.dumps({"type": "notice", "code": "NOT_IN_ROOM", "message": "방에 없음"}, ensure_ascii=False))
                     continue
 
-                room.chat.append({"role": "user", "sender": player.nickname, "content": user_text, "ts": time.time()})
-                chat_copy = list(room.chat)
+                # ====== PICK 단계 ======
+                if room.phase == "pick":
+                    if msg_type != "pick":
+                        await websocket.send_text(json.dumps({"type": "notice", "code": "NEED_PICK", "message": "첫 턴엔 포켓몬 이름을 선택해야 함"}, ensure_ascii=False))
+                        continue
+
+                    name = (data.get("name") or "").strip()
+                    if not name:
+                        await websocket.send_text(json.dumps({"type": "notice", "code": "EMPTY", "message": "포켓몬 이름 비었음"}, ensure_ascii=False))
+                        continue
+
+                    hit = find_pokemon_by_name(name)
+                    if not hit:
+                        await websocket.send_text(json.dumps({"type": "notice", "code": "NOT_FOUND", "message": "데이터에서 포켓몬 못찾음. 다른 이름으로 다시."}, ensure_ascii=False))
+                        continue
+
+                    _, doc = hit
+                    player.picked = True
+                    player.pokemon_name = name
+                    player.pokemon_doc = doc
+
+                    room.chat.append({"role": "system", "sender": "system", "content": f"{player.nickname} 포켓몬 선택: {name}", "ts": time.time()})
+
+                    # 턴 넘기기
+                    room.turn_index = (room.turn_index + 1) % len(room.players)
+
+                    # 둘 다 골랐으면 battle 진입
+                    if all(p.picked for p in room.players):
+                        room.phase = "battle"
+
+                    payload = {"type": "room_update", "room": snapshot_room(room)}
+
+                # ====== BATTLE 단계(자동, 1회) ======
+                if room.phase == "battle":
+                    # ✅ 중복 실행 방지
+                    room.phase = "battle_running"
+
+                    p1, p2 = room.players[0], room.players[1]
+                    chart = load_chart()
+                    sim = simulate_battle(p1.pokemon_doc, p2.pokemon_doc, chart)
+
+                    if sim["winner"] == "p1":
+                        winner_player_id = p1.player_id
+                        win_name = p1.nickname
+                    elif sim["winner"] == "p2":
+                        winner_player_id = p2.player_id
+                        win_name = p2.nickname
+                    else:
+                        winner_player_id = None
+                        win_name = "무승부"
+
+                    hits = [(1.0, p1.pokemon_doc), (1.0, p2.pokemon_doc)]
+                    context = build_rag_context_multi(hits, max_each_text=350, lang="ko")
+                    pairs_summary = "\n".join([
+                        f"- {p1.pokemon_name}→{p2.pokemon_name}: {sim['a_to_b']['move_type']} {sim['a_to_b']['mult']:.2f}x ({sim['a_to_b']['label']}) / score={sim['a_score']:.1f}",
+                        f"- {p2.pokemon_name}→{p1.pokemon_name}: {sim['b_to_a']['move_type']} {sim['b_to_a']['mult']:.2f}x ({sim['b_to_a']['label']}) / score={sim['b_score']:.1f}",
+                        f"- 최종 승자: {win_name}",
+                    ])
+
+                    battle_job = {
+                        "winner_player_id": winner_player_id,
+                        "win_name": win_name,
+                        "context": context,
+                        "pairs_summary": pairs_summary,
+                        "user_prompt": f"{p1.pokemon_name} vs {p2.pokemon_name} 배틀 결과 해설해줘. 승자는 {win_name}로 확정이야.",
+                    }
+
+                    # battle_running 상태도 클라에 바로 알려주고 싶으면 여기서 payload 만들어도 됨
+                    payload = {"type": "room_update", "room": snapshot_room(room)}
+
+            # pick 처리 payload는 일단 즉시 방송
+            if payload:
+                await broadcast_room(room, payload)
+
+            # =========================
+            # 2) 락 밖: LLM 실행(느린 작업)
+            # =========================
+            if battle_job is None:
+                continue
 
             try:
-                assistant_text = await asyncio.to_thread(answer_with_rag, user_text, chat_copy)
+                prompt = build_llm_prompt(
+                    user_prompt=battle_job["user_prompt"],
+                    memory_text="",
+                    lang="ko",
+                    context=battle_job["context"],
+                    pairs_summary=battle_job["pairs_summary"],
+                )
+                assistant_text = get_llm().invoke([HumanMessage(content=prompt)]).content
             except Exception as e:
-                assistant_text = f"(assistant) 처리 중 에러: {e}"
+                assistant_text = f"(assistant) 배틀 해설 생성 실패: {e}"
 
+            # =========================
+            # 3) 다시 락: 결과 반영 + ended
+            # =========================
             async with room.lock:
+                room.winner_player_id = battle_job["winner_player_id"]
                 room.chat.append({"role": "assistant", "sender": "assistant", "content": assistant_text, "ts": time.time()})
-                if len(room.players) >= 2:
-                    room.turn_index = (room.turn_index + 1) % len(room.players)
-                payload = {"type": "room_update", "room": snapshot_room(room)}
+                room.chat.append({"role": "system", "sender": "system", "content": f"게임 종료! 승자: {battle_job['win_name']}", "ts": time.time()})
+                room.phase = "ended"
 
-            await broadcast_room(room, payload)
+                final_payload = {"type": "room_update", "room": snapshot_room(room)}
+
+            await broadcast_room(room, final_payload)
 
     except WebSocketDisconnect:
         async with room.lock:

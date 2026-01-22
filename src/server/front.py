@@ -12,7 +12,6 @@ import websocket  # websocket-client
 API = "http://localhost:8000"
 WS_BASE = "ws://localhost:8000"
 
-WS_APPS = {}  # {player_id: websocket.WebSocketApp}
 
 st.set_page_config(page_title="Pokemon Battle Rooms (WS)", layout="wide")
 
@@ -21,7 +20,7 @@ st.set_page_config(page_title="Pokemon Battle Rooms (WS)", layout="wide")
 # REST helpers
 # =========================
 def get_rooms():
-    return requests.get(f"{API}/rooms", timeout=10).json()["rooms"]
+    return requests.get(f"{API}/rooms", timeout=30).json()["rooms"]
 
 def join_room(room_id, player_id, nickname):
     return requests.post(
@@ -45,7 +44,8 @@ def ws_url(room_id: int, player_id: str) -> str:
     return f"{WS_BASE}/ws/rooms/{room_id}/{player_id}"
 
 def ensure_ws_started(room_id: int, player_id: str):
-    if st.session_state.get("ws_thread_alive"):
+    # ws_app이 없거나, ws_thread_alive인데도 ws_app이 None이면 재시작
+    if st.session_state.get("ws_thread_alive") and st.session_state.get("ws_app") is not None:
         return
 
     if "ws_queue" not in st.session_state:
@@ -64,7 +64,7 @@ def ensure_ws_started(room_id: int, player_id: str):
 
     def on_close(ws, close_status_code, close_msg):
         q.put(json.dumps({"type": "ws_closed", "code": close_status_code, "msg": close_msg}, ensure_ascii=False))
-        WS_APPS.pop(player_id, None)
+        st.session_state.ws_app = None
 
     def run():
         ws = websocket.WebSocketApp(
@@ -74,14 +74,15 @@ def ensure_ws_started(room_id: int, player_id: str):
             on_error=on_error,
             on_close=on_close,
         )
-        WS_APPS[player_id] = ws
+        st.session_state.ws_app = ws
         ws.run_forever(ping_interval=20, ping_timeout=10)
 
     threading.Thread(target=run, daemon=True).start()
     st.session_state.ws_thread_alive = True
 
-def ws_send_chat(player_id: str, content: str) -> bool:
-    ws = WS_APPS.get(player_id)
+
+def ws_send_chat(content: str) -> bool:
+    ws = st.session_state.get("ws_app")
     if not ws:
         return False
     try:
@@ -90,15 +91,18 @@ def ws_send_chat(player_id: str, content: str) -> bool:
     except Exception:
         return False
 
-def ws_close(player_id: str):
-    ws = WS_APPS.pop(player_id, None)
+
+def ws_close():
+    ws = st.session_state.get("ws_app")
     if ws:
         try:
             ws.close()
         except Exception:
             pass
+    st.session_state.ws_app = None
     st.session_state.ws_thread_alive = False
     st.session_state.ws_connected = False
+
 
 
 # =========================
@@ -143,10 +147,22 @@ def drain_ws_messages():
 
     return changed
 
+def ws_send_pick(content: str) -> bool:
+    ws = st.session_state.get("ws_app")
+    if not ws:
+        return False
+    try:
+        ws.send(json.dumps({"type": "pick", "name": content}, ensure_ascii=False))
+        return True
+    except Exception:
+        return False
+
 
 # =========================
 # state init
 # =========================
+if "ws_app" not in st.session_state:
+    st.session_state.ws_app = None
 if "player_id" not in st.session_state:
     st.session_state.player_id = str(uuid.uuid4())
 if "nickname" not in st.session_state:
@@ -189,7 +205,7 @@ if st.session_state.room_id is None:
                 st.error(f"입장 실패: {res}")
                 st.stop()
 
-            ws_close(st.session_state.player_id)
+            ws_close()
 
             st.session_state.room_id = r["room_id"]
             st.session_state.room = res["room"]
@@ -213,13 +229,15 @@ else:
 
     st.subheader(f"방 {room_id}")
     st.caption("🟢 WS: connected" if st.session_state.ws_connected else "🟡 WS: connecting...")
-
+    if not st.session_state.ws_connected:
+        st.warning("웹소켓 연결중입니다. 잠시만 기다려주세요.")
+        st.stop()
     if st.button("나가기"):
         try:
             leave_room(room_id, my_id)
         except Exception:
             pass
-        ws_close(my_id)
+        ws_close()
         st.session_state.room_id = None
         st.session_state.room = None
         st.rerun()
@@ -235,32 +253,61 @@ else:
     players = room.get("players", []) or []
     turn_id = room.get("turn_player_id")
 
+    phase = room.get("phase", "pick")
+
+
     if len(players) < 2:
         st.warning("상대방 입장 대기 중 (2명 되면 시작)")
     else:
         if turn_id == my_id:
-            st.success("니 턴")
+            st.success("나의 턴")
         else:
             st.info("상대 턴")
 
     for m in room.get("chat", []) or []:
         st.markdown(f"**[{m.get('sender','')}]** {m.get('content','')}")
 
+
+    if phase == "pick":
+        st.info("포켓몬 선택 단계입니다. 사용할 포켓몬 이름을 입력해주세요.")
+    elif phase == "battle":
+        st.info("배틀 진행 중... AI가 배틀 내용을 생성중입니다..")
+    elif phase == "ended":
+        winner = room.get("winner_player_id")
+        if winner == my_id:
+            st.success("🎉승리!")
+        elif winner:
+            st.error("😵 패배...")
+        else:
+            st.warning("🤝 무승부!")
+        st.info("게임 종료! '나가기' 버튼을 눌러주세요.")
+    else:
+        st.warning(f"알 수 없는 phase: {phase}")
+
+    me = next((p for p in players if p.get("player_id") == my_id), None)
+    my_picked = bool(me and me.get("picked"))
+
+    if phase == "pick" and my_picked:
+        st.success("✅ 포켓몬 선택 완료! 상대 선택 기다리는 중...")
+
     disabled = (
-        (len(players) < 2)  # 2명 되기 전엔 무조건 막기
-        or (turn_id is not None and turn_id != my_id)  # 턴제
-        or (not st.session_state.ws_connected)  # WS 연결 안 됨
+        (len(players) < 2)
+        or (turn_id is not None and turn_id != my_id)
+        or (not st.session_state.ws_connected)
+        or (phase in ("battle", "ended"))
+        or (phase == "pick" and my_picked)
     )
 
-    with st.form("chat_form", clear_on_submit=True):
-        text = st.text_input("메시지", key="msg", disabled=disabled)
-        submitted = st.form_submit_button("전송", disabled=disabled)
+    if phase == "pick":
+        with st.form("pick_form", clear_on_submit=True):
+            name = st.text_input("포켓몬 이름", key="pick_name", disabled=disabled)
+            submitted = st.form_submit_button("선택", disabled=disabled)
+        if submitted and name.strip():
+            ok = ws_send_pick(my_id, name.strip())
+            if not ok:
+                st.warning("선택 전송 실패(웹소켓 연결 확인)")
+            st.rerun()
 
-    if submitted and text.strip():
-        ok = ws_send_chat(my_id, text.strip())
-        if not ok:
-            st.warning("전송 실패(웹소켓 연결 확인)")
+    if phase != "ended":
+        time.sleep(0.2)
         st.rerun()
-
-    time.sleep(0.2)
-    st.rerun()
