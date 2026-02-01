@@ -96,8 +96,10 @@ Embedding: all-MiniLM-L6-v2
 - LLM 답변: 근거(EVIDENCE) 기반 프롬프트 강제 → 환각 발생률 0% 목표
 
 ## 9. 데모 화면
+
 ![데모 화면](images/img1.png)
 > 챗봇 데모 화면1
+
 ![데모 화면](images/img2.png)
 > 챗봇 데모 화면2
 
