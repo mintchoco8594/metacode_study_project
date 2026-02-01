@@ -1,10 +1,12 @@
 # metacode_study_project
 # 메타코드 스터디 실습프로젝트
 
-## 프로젝트 개요: Pokémon Battle Simulation Chat API
+## 프로젝트 개요: Pokémon Battle Simulation Chatbot
+
+제작자: 김진성
 
 ### 1. 한줄 소개
-포켓몬 배틀 지식 중 정답이 고정된 영역(타입 상성 등)은 룰 엔진으로 100% 결정하고,  
+포켓몬 배틀 지식 중 정답이 고정된 영역(타입 상성 등)은 룰 엔진으로 100% 결정하고,
 설명·요약·맥락 보강은 **RAG 기반 LLM**이 담당하는 하이브리드 Pokémon 배틀 챗봇 & 시뮬레이션 시스템.
 
 거기에 나아가 구현된 AI 시스템을 활용하여 게임이라는 주제에 부합하도록 포켓몬 게임 시뮬레이션을 구현하여 멀티플레이 웹 게임 서버를 러프하게 구현.
@@ -21,24 +23,23 @@
 (1) 사용자 입력 질문에 따라 포켓몬에 대한 정보를 RAG를 통해 검색 후 LLM으로 답변을 생성하여 리턴
 
 (2) 룰 엔진 기반 타입 상성 Q&A  
-→ **배율/유불리는 LLM이 아닌 룰 엔진이 단독으로 계산**  
-→ LLM은 계산 결과를 설명하는 역할만 수행
+- **배율/유불리는 LLM이 아닌 룰 엔진이 단독으로 계산**  
+- LLM은 계산 결과를 설명하는 역할만 수행
 
-예)
-“이상해씨 상대로 유리한 타입 알려줘”
+    예) 
+    -  “이상해씨 상대로 유리한 타입 알려줘”
 
-“불꽃 타입이 강한/약한 타입은?”
+    -  “불꽃 타입이 강한/약한 타입은?”
 
-“물/땅 복합 타입 상대로 전기 기술이 몇 배?”
+    -  “물/땅 복합 타입 상대로 전기 기술이 몇 배?”
 
-→ 룰 엔진이 배율 계산을 확정하고, LLM은 결과 해설만 담당
+    -  → 룰 엔진이 배율 계산을 확정하고, LLM은 결과 해설만 담당
 
-**Why Rule Engine + RAG?**
-- LLM은 타입 상성처럼 **정답이 고정된 문제에서 자주 오류를 발생**
-- 본 프로젝트는 해당 영역을 룰 엔진으로 분리하여
-  - 계산은 deterministic
-  - 설명은 generative
-  한 구조로 설계
+- **Why Rule Engine + RAG?**
+- - LLM은 타입 상성처럼 **정답이 고정된 문제에서 자주 오류를 발생**
+- - 본 프로젝트는 해당 영역을 룰 엔진으로 분리하여
+- - 계산은 deterministic
+- - 설명은 generative한 구조로 설계
 
 (3) 멀티플레이어 웹 게임 플레이가 가능한 웹 소프트웨어
 두명까지 참여 가능한 방에 입장 후, 싱글플레이 선택 혹은 상대방 입장시 사용할 포켓몬을 채팅으로 입력
@@ -48,14 +49,18 @@
 데이터셋 확장으로 더 많은 종류의 포켓몬을 추가 등록하거나, 소지도구 또는 특성까지 포함하여 상성을 계산한다면 더욱 실제와 비슷하게 시뮬레이션 제공 가능
 배틀 내용 및 결과를 프롬프트에 입력하여 이미지 혹은 비디오 생성 AI로 시각적 결과를 제공
 
+\newpage
 
 ## 5. 데이터 소스
-The Complete Pokédex Dataset by Cristobal Mitchell,
-Pokemon Pokedex with Stats by Kumar Arnav 
--1세대 포켓몬 대상으로 사용할 데이터만 추출하여 정제 후 상성 분석/정량 계산용으로 사용
+The Complete Pokédex Dataset by Cristobal Mitchell
+→ https://www.kaggle.com/datasets/cristobalmitchell/pokedex
+
+Pokemon Pokedex with Stats by Kumar Arnav
+→ https://www.kaggle.com/datasets/arnavvvvv/pokemon-pokedex
+- 1세대 포켓몬 대상으로 사용할 데이터만 추출하여 정제 후 상성 분석/정량 계산용으로 사용
 
 벡터DB 인덱싱 대상:
-1세대 포켓몬의 이름, 타입, 종족값
+- 1세대 포켓몬의 이름, 타입, 종족값
 
 ## 6. 시스템 아키텍처
 ### 챗봇 파이프라인
@@ -85,7 +90,7 @@ LLM은 매 라운드 결과를 **해설자 역할**로 자연어 설명한다.
 
 ## 7. 기술 스택
 
-Python, FastAPI, Langchain, KeyBert
+Python, FastAPI, Langchain, KeyBert, WebSocket
 
 Vector DB: FAISS
 
@@ -94,6 +99,8 @@ Embedding: all-MiniLM-L6-v2
 ## 8. 평가 방법
 - 룰 질문: 배율/유불리 계산은 코드로 확정 → 정답 정확도 100%
 - LLM 답변: 근거(EVIDENCE) 기반 프롬프트 강제 → 환각 발생률 0% 목표
+
+\newpage
 
 ## 9. 데모 화면
 
