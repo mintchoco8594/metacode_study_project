@@ -9,7 +9,7 @@ import streamlit as st
 import faiss
 from sentence_transformers import SentenceTransformer
 from keybert import KeyBERT
-from src.utils import type_calc
+from utils import type_calc
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import os
@@ -283,12 +283,6 @@ def render_results(results: list[dict]):
         st.write("---")
 
 
-def ask_llm_only(user_prompt: str, lang: str) -> str:
-    llm = get_llm()
-    memory_text = build_chat_memory(max_turns=6, lang=lang)
-    prompt_for_llm = build_llm_prompt(user_prompt, memory_text, lang)
-    return llm.invoke([HumanMessage(content=prompt_for_llm)]).content
-
 def build_rag_context_multi(hits: list[tuple[float, dict]], max_each_text: int = 400, lang: str = "ko") -> str:
     lines = []
     for score, doc in hits:
@@ -439,9 +433,15 @@ if prompt:
             "parsed": parsed,
             "hits": hits,
         }
-    
+    type_context = ""
+    if type_calc.is_type_question(prompt, valid_types):
+        type_context = type_calc.build_type_context(
+            chart, valid_types, prompt, lang
+        )  
     if len(hits) == 1:
         context_one = build_rag_context_multi(hits, max_each_text=500, lang=lang)
+        if type_context:
+            context_one = (context_one + "\n\n" + type_context).strip()
         llm = get_llm()
         memory_text = build_chat_memory(max_turns=6, lang=lang)
 
@@ -454,7 +454,16 @@ if prompt:
         explain = llm.invoke([HumanMessage(content=prompt_for_llm)]).content
         st.session_state.chat.append({"role": "assistant", "content": explain})
     elif len(hits) == 0:
-        explain = ask_llm_only(prompt, lang)
+        llm = get_llm()
+        memory_text = build_chat_memory(max_turns=6, lang=lang)
+
+        prompt_for_llm = build_llm_prompt(
+            user_prompt=prompt,
+            memory_text=memory_text,
+            lang=lang,
+            context=type_context   # ← 여기 핵심
+        )
+        explain = llm.invoke([HumanMessage(content=prompt_for_llm)]).content
         st.session_state.chat.append({"role": "assistant", "content": explain})
     else:
         results = []
@@ -487,6 +496,8 @@ if prompt:
         llm = get_llm()
         memory_text = build_chat_memory(max_turns=6, lang=lang)
         context_multi = build_rag_context_multi(hits, max_each_text=350, lang=lang)
+        if type_context:
+            context_multi = (context_multi + "\n\n" + type_context).strip()
         prompt_for_llm = build_llm_prompt(
             user_prompt=refined_prompt,
             memory_text=memory_text,
